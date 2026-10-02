@@ -1,5 +1,7 @@
 # uart-data-logger
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Language](https://img.shields.io/badge/language-Python-blue.svg)](uart_logger.py) [![Tests](https://img.shields.io/badge/tests-23%20passing-brightgreen.svg)](#)
+
 A small Python CLI tool that reads frames from a serial port, stamps each one with a UTC timestamp, and appends them to a CSV file. If the port drops or fails to open, it waits and reconnects automatically (configurable delay and retry limit). Ctrl-C stops logging cleanly.
 
 Built for unattended logging from dev boards — I got tired of babysitting a terminal during long test runs, so this keeps going on its own when the USB adapter flakes out.
