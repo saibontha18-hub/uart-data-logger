@@ -1,6 +1,11 @@
 # uart-data-logger
 
-A small Python CLI tool that reads newline-terminated frames from a serial port, stamps each one with a UTC timestamp, and appends them to a CSV file. If the port drops or fails to open, it waits and reconnects automatically (configurable delay and retry limit). Ctrl-C stops logging cleanly.
+A small Python CLI tool that reads frames from a serial port, stamps each one with a UTC timestamp, and appends them to a CSV file. If the port drops or fails to open, it waits and reconnects automatically (configurable delay and retry limit). Ctrl-C stops logging cleanly.
+
+Two framing modes:
+
+- **Line mode** (default): newline-terminated text frames.
+- **Fixed-frame mode** (`--frame SYNC LEN`): fixed-length binary frames that must start with the sync byte `SYNC` and carry a valid trailing XOR checksum; anything else is dropped and counted as an error.
 
 ## Prerequisites
 
@@ -17,9 +22,23 @@ python uart_logger.py --port /dev/ttyUSB0
 # custom baud rate, output file, and reconnect behavior
 python uart_logger.py --port /dev/ttyUSB0 --baud 9600 \
     --output logs/run1.csv --reconnect-delay 5 --max-retries 10
+
+# live throughput stats on stderr (frames/s, bytes/s, error count)
+python uart_logger.py --port /dev/ttyUSB0 --stats
+
+# rotate to a new timestamped CSV file every 10 MB
+python uart_logger.py --port /dev/ttyUSB0 --max-size 10485760
+
+# fixed-frame mode: 8-byte frames, sync 0xAA, trailing XOR checksum
+python uart_logger.py --port /dev/ttyUSB0 --frame 0xAA 8
 ```
 
-CSV columns: `timestamp` (ISO-8601 UTC), `port`, `frame`.
+CSV columns: `timestamp` (ISO-8601 UTC), `port`, `frame`. In fixed-frame mode
+the `frame` column holds the hex-encoded frame bytes.
+
+Rotated files are named by inserting a UTC timestamp before the extension:
+`logs/run1.csv` → `logs/run1_20261002T080001.csv`, and each file carries its
+own CSV header.
 
 Example output:
 
@@ -39,9 +58,13 @@ python -m pytest tests/ -v
 
 ## Files
 
-- `uart_logger.py` — the logger (argparse CLI, reconnect loop, CSV writer)
+- `uart_logger.py` — the logger (argparse CLI, reconnect loop, CSV writer,
+  `--stats` throughput reporting, `--max-size` log rotation, `--frame`
+  checksum-validated fixed frames)
 - `requirements.txt` — `pyserial`, `pytest`
-- `tests/test_uart_logger.py` — tests with a `FakeSerial` stub covering logging, reconnects, retry limits, and CLI defaults
+- `tests/test_uart_logger.py` — tests with a `FakeSerial` stub covering
+  logging, reconnects, retry limits, CLI defaults, stats, rotation, and
+  fixed-frame validation
 
 ## License
 
