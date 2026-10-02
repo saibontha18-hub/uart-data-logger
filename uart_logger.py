@@ -27,10 +27,10 @@ CSV_FIELDS = ["timestamp", "port", "frame"]
 
 
 class LinkStats:
-    """Throughput/error counters with per-interval rate snapshots.
+    """Byte/frame/error counters with per-second rate snapshots.
 
-    `clock` is injectable (defaults to time.monotonic) so tests can drive
-    the reporting interval deterministically.
+    `clock` defaults to time.monotonic, but tests inject a fake one so
+    the reporting interval stays deterministic.
     """
 
     def __init__(self, clock=time.monotonic):
@@ -105,7 +105,7 @@ def parse_args(argv=None):
 def parse_frame_spec(spec):
     """Parse --frame SYNC LEN into (sync_byte, length).
 
-    Accepts decimal or 0x-prefixed hex. Raises ValueError on bad input.
+    Accepts decimal or 0x-prefixed hex; raises ValueError on junk.
     """
     if spec is None:
         return None
@@ -131,11 +131,7 @@ def xor_checksum(data):
 
 
 def validate_frame(raw, sync, length):
-    """True if raw is a valid frame: sync byte, exact length, XOR checksum.
-
-    Frame layout: [SYNC][payload ...][checksum], where checksum is the XOR
-    of every preceding byte.
-    """
+    """True if raw is a valid fixed frame: [SYNC][payload...][XOR checksum]."""
     return (len(raw) == length and raw[0] == sync
             and xor_checksum(raw[:-1]) == raw[-1])
 
@@ -151,12 +147,12 @@ def rotated_name(output):
 
 
 class CsvSink:
-    """CSV file writer with optional size-based rotation.
+    """CSV writer with size-based rotation.
 
-    Opens `output` in append mode, writing a header when the file is empty.
-    After every row, if max_size > 0 and the file has grown past it, the
-    file is closed and a new timestamped one is opened. `files` records
-    every path opened (useful for tests).
+    Opens `output` in append mode, writing a header only when the file is
+    empty. After each row, if max_size > 0 and we've grown past it, the
+    file is closed and a fresh timestamped one is opened. `files` lists
+    every path opened, which the rotation tests rely on.
     """
 
     def __init__(self, output, max_size=0):
@@ -205,20 +201,19 @@ def decode_frame(raw):
 
 
 def read_frames(ser, writer, port, stop, stats=None, frame_spec=None):
-    """Read frames until stop is set or the port fails.
+    """Read frames until stop is set or the port blows up.
 
-    stats: optional LinkStats; when provided, received bytes/frames/errors
-    are counted and a one-line throughput report is printed to stderr once
-    per second.
+    stats: optional LinkStats — counts bytes/frames/errors and prints a
+    throughput line to stderr once per second.
 
-    frame_spec: optional (sync_byte, length) tuple enabling fixed-frame
-    mode. Each frame is read as exactly `length` bytes; frames with a wrong
-    sync byte, short read, or bad trailing XOR checksum are dropped and
-    counted as errors instead of being logged (valid frames are logged
+    frame_spec: optional (sync, length) tuple for fixed-frame mode. Each
+    frame comes in as exactly `length` bytes; anything with a wrong sync
+    byte, a short read, or a bad trailing checksum is dropped and counted
+    as an error instead of being logged (good frames are logged
     hex-encoded).
 
-    Returns (clean_exit, frames_logged): clean_exit is True when stop was
-    requested, False when the port raised (caller should reconnect).
+    Returns (clean_exit, frames_logged); clean_exit is False when the
+    port raised and the caller should reconnect.
     """
     count = 0
 
