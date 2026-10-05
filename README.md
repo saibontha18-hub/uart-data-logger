@@ -52,6 +52,13 @@ timestamp,port,frame
 2026-10-02T08:00:02.031209+00:00,/dev/ttyUSB0,temp=21.6
 ```
 
+## Screenshots
+
+Live run over a virtual serial pair (`socat`-created PTYs): valid fixed frames
+land in the CSV while corrupt ones are dropped and counted in the stats line.
+
+![live demo over a virtual serial pair: valid frames logged, corrupt frames counted](docs/screenshots/live-demo.png)
+
 ## Tests
 
 The test suite uses a fake serial port, so no hardware is needed:
