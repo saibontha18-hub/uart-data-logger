@@ -136,6 +136,51 @@ def validate_frame(raw, sync, length):
             and xor_checksum(raw[:-1]) == raw[-1])
 
 
+class FrameSync:
+    """Buffered sync-byte scanner for fixed-frame mode.
+
+    pyserial's read(n) returns whatever arrived before the timeout, which
+    is often fewer than n bytes — so one read() is not one frame, and a
+    bare read(length) loop silently desyncs the stream on the first short
+    read. This keeps a buffer across reads, scans it byte by byte for the
+    SYNC byte (dropping anything before it as partial-read junk), and only
+    hands back a candidate once `length` bytes sit behind a SYNC. A
+    rejected candidate is dropped whole; scanning then resumes after it.
+    """
+
+    def __init__(self, ser, sync, length):
+        self._ser = ser
+        self._sync = sync
+        self._length = length
+        self._buf = b""
+
+    def next_candidate(self):
+        """Return (candidate, bytes_read).
+
+        candidate is a length-byte frame starting with SYNC, or None on a
+        read timeout — partial data stays buffered across calls, so a frame
+        split over several reads still assembles. bytes_read is how many
+        new bytes came off the port in this call, for the stats counters.
+        Whatever ser.read() raises propagates, so the caller still
+        reconnects on a dropped port.
+        """
+        nbytes = 0
+        while True:
+            # drop everything before the first sync byte, one byte at a
+            # time — it's leftover from a partial read, not a frame start
+            while self._buf and self._buf[0] != self._sync:
+                self._buf = self._buf[1:]
+            if len(self._buf) >= self._length:
+                cand = self._buf[:self._length]
+                self._buf = self._buf[self._length:]
+                return cand, nbytes
+            chunk = self._ser.read(self._length - len(self._buf))
+            if not chunk:
+                return None, nbytes
+            nbytes += len(chunk)
+            self._buf += chunk
+
+
 def _utc_stamp():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
@@ -164,6 +209,14 @@ class CsvSink:
         self._open(output)
 
     def _open(self, path):
+        # The README's own examples log to paths like logs/run1.csv; dying
+        # with FileNotFoundError on a documented invocation is a papercut,
+        # so create the directory — the user already told us where the
+        # file should live. Also covers rotation, which reopens here with
+        # the same parent directory.
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self._fh = open(path, "a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._fh, fieldnames=CSV_FIELDS)
         if self._fh.tell() == 0:
@@ -206,9 +259,11 @@ def read_frames(ser, writer, port, stop, stats=None, frame_spec=None):
     stats: optional LinkStats — counts bytes/frames/errors and prints a
     throughput line to stderr once per second.
 
-    frame_spec: optional (sync, length) tuple for fixed-frame mode. Each
-    frame comes in as exactly `length` bytes; anything with a wrong sync
-    byte, a short read, or a bad trailing checksum is dropped and counted
+    frame_spec: optional (sync, length) tuple for fixed-frame mode. The
+    stream is buffered and scanned for the SYNC byte before assembly, so
+    short reads from the port can't silently desync it. Bytes ahead of a
+    sync byte are skipped as resync junk (not counted); a candidate that
+    starts with SYNC but fails its trailing checksum is dropped and counted
     as an error instead of being logged (good frames are logged
     hex-encoded).
 
@@ -216,6 +271,7 @@ def read_frames(ser, writer, port, stop, stats=None, frame_spec=None):
     port raised and the caller should reconnect.
     """
     count = 0
+    frame_reader = FrameSync(ser, *frame_spec) if frame_spec else None
 
     def _report():
         if stats is not None and stats.report_due():
@@ -225,21 +281,25 @@ def read_frames(ser, writer, port, stop, stats=None, frame_spec=None):
 
     while not stop.is_set():
         try:
-            raw = ser.read(frame_spec[1]) if frame_spec else ser.readline()
+            if frame_reader is not None:
+                raw, nbytes = frame_reader.next_candidate()
+            else:
+                raw = ser.readline()
+                nbytes = len(raw)
         except Exception:
             return False, count
+        if stats is not None:
+            stats.record_rx(nbytes)
         if not raw:
             continue  # read timeout, keep waiting
-        if stats is not None:
-            stats.record_rx(len(raw))
 
-        if frame_spec is not None:
+        if frame_reader is not None:
             sync, length = frame_spec
-            if len(raw) != length or not validate_frame(raw, sync, length):
+            if not validate_frame(raw, sync, length):
                 if stats is not None:
                     stats.record_error()
                 _report()
-                continue
+                continue  # bad frame already dropped; scan resumes after it
             frame = raw.hex()
         else:
             frame = decode_frame(raw)

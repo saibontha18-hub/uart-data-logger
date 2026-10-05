@@ -12,14 +12,16 @@ import uart_logger
 class FakeSerial:
     """Minimal pyserial stand-in: serves scripted lines, then stops."""
 
-    def __init__(self, lines, fail_after=None, chunks=None):
+    def __init__(self, lines, fail_after=None, chunks=None, max_read=None):
         # lines: list of bytes returned by readline(); fail_after=N raises
         # SerialError on the Nth read call to simulate a dropped port.
         # chunks: list of bytes objects served (and consumed) by read(n),
-        # for fixed-frame mode.
+        # for fixed-frame mode. max_read: cap each read() at this many bytes
+        # to emulate pyserial short reads on a real port.
         self._lines = list(lines)
         self._chunks = list(chunks) if chunks else []
         self._fail_after = fail_after
+        self._max_read = max_read
         self._calls = 0
         self.closed = False
 
@@ -38,12 +40,17 @@ class FakeSerial:
         out = b""
         while self._chunks and len(out) < n:
             need = n - len(out)
+            if self._max_read is not None:
+                # one short read per call, like a timeout-driven real port
+                need = min(need, self._max_read)
             chunk = self._chunks[0]
             out += chunk[:need]
             if len(chunk) <= need:
                 self._chunks.pop(0)
             else:
                 self._chunks[0] = chunk[need:]
+            if self._max_read is not None:
+                break
         return out
 
     def close(self):
@@ -264,6 +271,18 @@ def test_csv_sink_writes_header_once(tmp_path):
         assert fh.read().count("timestamp,port,frame") == 1
 
 
+def test_csv_sink_creates_missing_directory(tmp_path):
+    # the README's examples use logs/run1.csv — the directory must not
+    # need to exist beforehand
+    out = str(tmp_path / "newdir" / "nested" / "a.csv")
+    sink = uart_logger.CsvSink(out)
+    sink.writerow({"timestamp": "t", "port": "p", "frame": "f"})
+    sink.close()
+    with open(out, encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["frame"] for r in rows] == ["f"]
+
+
 def test_csv_sink_rotates_on_max_size(tmp_path):
     out = str(tmp_path / "log.csv")
     lines = [b"f%d\n" % i for i in range(10)]
@@ -347,7 +366,11 @@ def test_validate_frame():
 def test_frame_mode_logs_valid_frames_hex():
     stop = threading.Event()
     buf, writer = make_writer()
-    good1 = make_frame(0xAA, b"\x01\x02\x03")  # 5 bytes
+    # payloads picked so no payload byte and no checksum equals the 0xAA
+    # sync byte — otherwise the resync scanner can glue a rejected frame's
+    # tail to the next chunk into a phantom "valid" frame, which is correct
+    # streaming behavior but makes for a confusing test
+    good1 = make_frame(0xAA, b"\x01\x02\x04")
     good2 = make_frame(0xAA, b"\x04\x05\x06")
     bad_sync = bytes([0xBB]) + good1[1:]
     bad_crc = good1[:-1] + bytes([good1[-1] ^ 0xFF])
@@ -360,13 +383,17 @@ def test_frame_mode_logs_valid_frames_hex():
 
     assert clean is False  # port "dropped" after 4 reads
     assert count == 2  # only the valid frames logged
-    assert stats.errors == 2  # bad sync + bad checksum counted
+    # the wrong-sync frame is skipped as resync junk, not counted; only
+    # the frame that survived sync but failed its checksum is an error
+    assert stats.errors == 1
     buf.seek(0)
     rows = list(csv.DictReader(buf))
     assert [r["frame"] for r in rows] == [good1.hex(), good2.hex()]
 
 
-def test_frame_mode_short_read_counts_error():
+def test_frame_mode_drops_partial_frame_on_port_drop():
+    # a short read is buffered, not an error; if the port then drops,
+    # the incomplete frame is simply lost and the caller reconnects
     stop = threading.Event()
     buf, writer = make_writer()
     ser = FakeSerial([], chunks=[b"\xAA\x01"], fail_after=1)  # 2 of 5 bytes
@@ -377,9 +404,72 @@ def test_frame_mode_short_read_counts_error():
 
     assert clean is False
     assert count == 0
-    assert stats.errors == 1
+    assert stats.errors == 0  # incomplete data is not a bad frame
     buf.seek(0)
     assert list(csv.DictReader(buf)) == []
+
+
+def test_frame_mode_assembles_split_frames():
+    # 1-byte reads: a frame split across many reads still assembles
+    stop = threading.Event()
+    buf, writer = make_writer()
+    good = make_frame(0xAA, b"\x01\x02\x03")  # 5 bytes
+    ser = FakeSerial([], chunks=[good], max_read=1)
+    stats = uart_logger.LinkStats()
+
+    stop_after_n_writes(stop, 1, buf)
+    clean, count = uart_logger.read_frames(ser, writer, "COM1", stop,
+                                           stats=stats, frame_spec=(0xAA, 5))
+
+    assert (clean, count) == (True, 1)
+    assert stats.errors == 0
+    assert stats.bytes == 5  # every byte off the port still counted
+    buf.seek(0)
+    rows = list(csv.DictReader(buf))
+    assert rows[0]["frame"] == good.hex()
+
+
+def test_frame_mode_skips_junk_before_sync():
+    # garbage bytes (line noise, a truncated frame) ahead of the sync
+    # byte must not desync the stream
+    stop = threading.Event()
+    buf, writer = make_writer()
+    good = make_frame(0xAA, b"\x09\x08\x07")  # 5-byte frame
+    ser = FakeSerial([], chunks=[b"\x00\xffnoise", good], max_read=2)
+    stats = uart_logger.LinkStats()
+
+    stop_after_n_writes(stop, 1, buf)
+    clean, count = uart_logger.read_frames(ser, writer, "COM1", stop,
+                                           stats=stats, frame_spec=(0xAA, 5))
+
+    assert (clean, count) == (True, 1)
+    assert stats.errors == 0
+    buf.seek(0)
+    rows = list(csv.DictReader(buf))
+    assert rows[0]["frame"] == good.hex()
+
+
+def test_frame_mode_recovers_after_bad_checksum_short_reads():
+    # corrupt frame mid-stream, everything arriving 1 byte at a time:
+    # the bad frame is dropped and counted, valid ones still log
+    stop = threading.Event()
+    buf, writer = make_writer()
+    good1 = make_frame(0xAA, b"\x01\x02\x03")
+    bad = good1[:-1] + bytes([good1[-1] ^ 0xFF])
+    good2 = make_frame(0xAA, b"\x04\x05\x06")
+    ser = FakeSerial([], chunks=[good1, bad, good2], max_read=1)
+    stats = uart_logger.LinkStats()
+
+    stop_after_n_writes(stop, 2, buf)
+    clean, count = uart_logger.read_frames(ser, writer, "COM1", stop,
+                                           stats=stats, frame_spec=(0xAA, 5))
+
+    assert clean is True
+    assert count == 2
+    assert stats.errors == 1
+    buf.seek(0)
+    rows = list(csv.DictReader(buf))
+    assert [r["frame"] for r in rows] == [good1.hex(), good2.hex()]
 
 
 def test_frame_mode_works_without_stats():
